@@ -1,0 +1,550 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  High-availability file sharing - two EC2 instances in different AZs share one encrypted
+  EFS file system, and a cron job syncs /share/projects to a private S3 bucket. No inbound
+  admin ports; servers are managed through SSM Session Manager.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    arch: VPC (2 public subnets, 2 AZs) -> 2x EC2 (1 per AZ) -> EFS (1 mount target per AZ); EC2 cron -> S3 via gateway endpoint
+    must:
+      - no SG ingress on file servers; admin access only via SSM Session Manager
+      - EFS reachable only from FileServerSecurityGroup on TCP 2049, with TLS + IAM auth
+    ref:
+      - { at: README.md, has: architecture + deploy/test/cleanup steps, scope: repo }
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ha-file-share
+    AllowedPattern: '^[a-z][a-z0-9-]{2,24}$'
+    ConstraintDescription: 3-25 characters - lowercase letters, digits and hyphens, starting with a letter.
+    Description: Short lowercase name used in resource names and tags.
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/16$'
+    ConstraintDescription: Must be a /16 CIDR block, for example 10.20.0.0/16.
+    Description: CIDR block for the VPC. Two /24 public subnets are carved out of it.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+    Description: EC2 instance type for both file servers.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Amazon Linux 2023 AMI, resolved from the public SSM parameter so every launch gets the latest patched image.
+  SyncSchedule:
+    Type: String
+    Default: '*/5 * * * *'
+    AllowedPattern: '^[0-9*/,\- ]+$'
+    ConstraintDescription: Must be a five-field cron expression, for example */5 * * * *.
+    Description: Cron schedule for the EFS -> S3 sync job.
+
+Resources:
+  # ---------------------------------------------------------------- Network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: dedicated lab network; DNS hostnames on so EFS mount-target DNS names resolve
+        must:
+          - EnableDnsSupport & EnableDnsHostnames true, else EFS DNS mount fails
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: public IP gives SSM + package egress without NAT GW cost; SG has no ingress so servers stay unreachable from internet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-a'
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-b'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt'
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: keeps S3 sync traffic on the AWS network; gateway endpoints are free
+        must:
+          - no restrictive endpoint policy - AL2023 package repos are also served from S3
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PublicRouteTable
+
+  # Stateless subnet firewall (defence in depth on top of security groups)
+  PublicNetworkAcl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-nacl'
+
+  NaclInboundFromVpc:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNetworkAcl
+      RuleNumber: 100
+      Egress: false
+      Protocol: -1
+      RuleAction: allow
+      CidrBlock: !Ref VpcCidr
+
+  NaclInboundEphemeral:
+    Type: AWS::EC2::NetworkAclEntry
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: NACLs are stateless - return traffic for outbound HTTPS (SSM, S3, dnf) arrives on ephemeral ports
+    Properties:
+      NetworkAclId: !Ref PublicNetworkAcl
+      RuleNumber: 110
+      Egress: false
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+      PortRange:
+        From: 1024
+        To: 65535
+
+  NaclOutboundAll:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNetworkAcl
+      RuleNumber: 100
+      Egress: true
+      Protocol: -1
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+
+  PublicSubnetANaclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      NetworkAclId: !Ref PublicNetworkAcl
+
+  PublicSubnetBNaclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      NetworkAclId: !Ref PublicNetworkAcl
+
+  # ---------------------------------------------------------------- Security groups
+  FileServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: no ingress at all (SSM replaces SSH); egress limited to HTTPS + NFS to EFS
+        must:
+          - never add SSH/RDP ingress; use Session Manager
+    Properties:
+      GroupDescription: File servers - no inbound rules, HTTPS and NFS egress only
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to SSM, S3 and Amazon Linux package repositories
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-fileserver-sg'
+
+  FileServerToEfsEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !GetAtt FileServerSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      DestinationSecurityGroupId: !GetAtt EfsSecurityGroup.GroupId
+      Description: NFS (TLS) to EFS mount targets
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EFS mount targets - NFS from the file servers only
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 127.0.0.1/32
+          Description: No outbound traffic needed (security groups are stateful)
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-efs-sg'
+
+  EfsIngressFromFileServers:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt EfsSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !GetAtt FileServerSecurityGroup.GroupId
+      Description: NFS from file servers
+
+  # ---------------------------------------------------------------- Storage
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: shared working copy for both servers (regional, multi-AZ); Delete policy because S3 holds the durable copy and lab teardown must leave no billable orphans
+        must:
+          - policy must allow FileServerRole w/ ClientMount+ClientWrite+ClientRootAccess, else mounts fail
+          - keep aws:SecureTransport deny; clients mount with tls,iam
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+      FileSystemPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowFileServersThroughMountTargets
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt FileServerRole.Arn
+            Action:
+              - elasticfilesystem:ClientMount
+              - elasticfilesystem:ClientWrite
+              - elasticfilesystem:ClientRootAccess
+            Condition:
+              Bool:
+                elasticfilesystem:AccessedViaMountTarget: 'true'
+          - Sid: DenyUnencryptedTransport
+            Effect: Deny
+            Principal:
+              AWS: '*'
+            Action: '*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-efs'
+
+  MountTargetA:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroups:
+        - !GetAtt EfsSecurityGroup.GroupId
+
+  MountTargetB:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref PublicSubnetB
+      SecurityGroups:
+        - !GetAtt EfsSecurityGroup.GroupId
+
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: durable off-server copy of /share/projects; versioning protects against overwrite; Retain so backups survive stack deletion
+        must:
+          - keep public access fully blocked
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  BackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BackupBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt BackupBucket.Arn
+              - !Sub '${BackupBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ---------------------------------------------------------------- IAM
+  FileServerRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: least privilege - SSM core + write-only access to the projects/ prefix (no read, no delete)
+        must:
+          - EFS FileSystemPolicy trusts this role ARN; replacing the role breaks mounts until the policy updates
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: s3-backup-write-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListProjectsPrefixOnly
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt BackupBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - projects
+                      - projects/*
+              - Sid: UploadToProjectsPrefix
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                Resource: !Sub '${BackupBucket.Arn}/projects/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  FileServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref FileServerRole
+
+  # ---------------------------------------------------------------- Compute
+  FileServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: one LT for both servers; IMDSv2 required; encrypted root volume; UserData mounts EFS + installs sync cron (mirrors scripts/efs-s3-sync.sh)
+        must:
+          - UserData must not use bash ${...} syntax - !Sub would try to resolve it
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt FileServerInstanceProfile.Arn
+        SecurityGroupIds:
+          - !GetAtt FileServerSecurityGroup.GroupId
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # Bootstraps a file server: mounts the shared EFS file system and installs the EFS -> S3 sync job.
+            set -euxo pipefail
+
+            dnf install -y amazon-efs-utils cronie
+            systemctl enable --now crond
+
+            # 1. Mount EFS at /share using TLS + IAM authorization (persisted in fstab)
+            mkdir -p /share
+            grep -q "${FileSystem}" /etc/fstab || echo "${FileSystem}:/ /share efs _netdev,noresvport,tls,iam 0 0" >> /etc/fstab
+            for attempt in $(seq 1 30); do
+              if mountpoint -q /share || mount /share; then break; fi
+              echo "EFS not reachable yet (attempt $attempt) - retrying in 10s"
+              sleep 10
+            done
+            mountpoint -q /share
+            mkdir -p /share/projects
+
+            # 2. Sync settings
+            cat > /etc/efs-s3-sync.conf <<EOF
+            MOUNT_POINT=/share
+            SOURCE_DIR=/share/projects
+            BUCKET=${BackupBucket}
+            PREFIX=projects
+            AWS_DEFAULT_REGION=${AWS::Region}
+            EOF
+
+            # 3. Sync script (same as scripts/efs-s3-sync.sh in the repository)
+            cat > /usr/local/bin/efs-s3-sync.sh <<'EOF'
+            #!/bin/bash
+            # Copies new and changed files from the shared EFS folder to S3.
+            # Safe to run on both servers at once: S3 uploads are idempotent and flock stops overlapping runs.
+            set -euo pipefail
+            set -a; . /etc/efs-s3-sync.conf; set +a
+            LOG=/var/log/efs-s3-sync.log
+            exec 9>/run/efs-s3-sync.lock
+            if ! flock -n 9; then
+              echo "$(date -Is) previous sync still running - skipping" >> "$LOG"
+              exit 0
+            fi
+            if ! mountpoint -q "$MOUNT_POINT"; then
+              echo "$(date -Is) ERROR: $MOUNT_POINT is not mounted - nothing synced" >> "$LOG"
+              exit 1
+            fi
+            echo "$(date -Is) sync $SOURCE_DIR -> s3://$BUCKET/$PREFIX/" >> "$LOG"
+            aws s3 sync "$SOURCE_DIR" "s3://$BUCKET/$PREFIX/" --no-progress >> "$LOG" 2>&1
+            EOF
+            chmod 0755 /usr/local/bin/efs-s3-sync.sh
+
+            # 4. Schedule it
+            echo "${SyncSchedule} root /usr/local/bin/efs-s3-sync.sh" > /etc/cron.d/efs-s3-sync
+            chmod 0644 /etc/cron.d/efs-s3-sync
+
+            # 5. Keep the log small
+            if [ -d /etc/logrotate.d ]; then
+              printf '%s\n' '/var/log/efs-s3-sync.log {' '  weekly' '  rotate 4' '  compress' '  missingok' '  notifempty' '}' > /etc/logrotate.d/efs-s3-sync
+            fi
+
+  FileServerA:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - MountTargetA
+      - MountTargetB
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref FileServerLaunchTemplate
+        Version: !GetAtt FileServerLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-server-a'
+
+  FileServerB:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - MountTargetA
+      - MountTargetB
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref FileServerLaunchTemplate
+        Version: !GetAtt FileServerLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PublicSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-server-b'
+
+Outputs:
+  FileServerAId:
+    Description: Instance ID of the file server in AZ 1
+    Value: !Ref FileServerA
+  FileServerBId:
+    Description: Instance ID of the file server in AZ 2
+    Value: !Ref FileServerB
+  FileSystemId:
+    Description: Shared EFS file system ID
+    Value: !Ref FileSystem
+  BackupBucketName:
+    Description: S3 bucket that receives the synced files (retained after stack deletion)
+    Value: !Ref BackupBucket
+  ConnectToServerA:
+    Description: Open a shell on server A without SSH
+    Value: !Sub 'aws ssm start-session --target ${FileServerA} --region ${AWS::Region}'
+  ConnectToServerB:
+    Description: Open a shell on server B without SSH
+    Value: !Sub 'aws ssm start-session --target ${FileServerB} --region ${AWS::Region}'

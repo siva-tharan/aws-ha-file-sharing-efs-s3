@@ -1,0 +1,7 @@
+# /etc/efs-s3-sync.conf - read by /usr/local/bin/efs-s3-sync.sh
+# CloudFormation writes this file automatically; this copy documents the format.
+MOUNT_POINT=/share
+SOURCE_DIR=/share/projects
+BUCKET=ha-file-share-backupbucket-example
+PREFIX=projects
+AWS_DEFAULT_REGION=ap-south-1
